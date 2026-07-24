@@ -6,6 +6,8 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="manifest" href="data:application/json,{&quot;name&quot;:&quot;herdr-remote&quot;,&quot;short_name&quot;:&quot;herdr&quot;,&quot;display&quot;:&quot;standalone&quot;,&quot;background_color&quot;:&quot;%23e1e2e7&quot;,&quot;theme_color&quot;:&quot;%23e1e2e7&quot;}">
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/logo.svg">
 <title>herdr-remote</title>
 <script type="module">
 import { play, bind } from 'https://esm.sh/cuelume@0.1.2';
@@ -868,12 +870,26 @@ function runCommand(cmd) {
 // --- Web Push ---
 let pushSubscription = null;
 
+/// Ask the relay whether it publishes to ntfy, so we can tell the user notifications are covered even
+/// where the browser refuses to do Web Push. Returns false on any error — this is advisory only.
+async function relayHasNtfy() {
+  try {
+    const base = (localStorage.getItem('herdr_relay_url') || autoRelayUrl)
+      .replace(/^ws:/, 'http:').replace(/^wss:/, 'https:').replace(/\/+$/, '');
+    const r = await fetch(base + '/healthz', { cache: 'no-store' });
+    if (!r.ok) return false;
+    return !!(await r.json()).ntfy;
+  } catch (e) { return false; }
+}
+
 async function initPush() {
   // Service workers and push are gated behind a secure context. Serving the relay over plain http on
   // a Tailscale IP or *.ts.net name is not one, so report the real cause instead of blaming the browser.
   if (!window.isSecureContext) {
-    document.getElementById('pushStatus').textContent =
-      'Push needs HTTPS — unavailable over plain http (e.g. a Tailscale IP). Notifications still work while this tab is open.';
+    const ntfy = await relayHasNtfy();
+    document.getElementById('pushStatus').textContent = ntfy
+      ? 'Web Push needs HTTPS, but this relay publishes to ntfy — subscribe in the ntfy app to get alerts with this tab closed.'
+      : 'Push needs HTTPS — unavailable over plain http (e.g. a Tailscale IP). Notifications still work while this tab is open, or enable ntfy on the relay.';
     document.getElementById('pushToggle').style.display = 'none';
     return;
   }

@@ -44,12 +44,33 @@ WS_PORT = int(os.environ.get("HERDR_RELAY_PORT", "8375"))
 POLL_INTERVAL = 2
 AUTH_TOKEN = os.environ.get("HERDR_RELAY_TOKEN", "")  # Optional: shared secret for relay auth
 
-# VAPID Web Push
+# VAPID Web Push — the default notification path
 VAPID_PUBLIC_KEY = os.environ.get("HERDR_VAPID_PUBLIC", "")
 VAPID_PRIVATE_KEY = os.environ.get("HERDR_VAPID_PRIVATE", "")
 VAPID_SUBJECT = os.environ.get("HERDR_VAPID_SUBJECT", "mailto:herdr@localhost")
 push_subscriptions = []  # list of PushSubscription dicts
 PUSH_SUBS_FILE = os.path.join(LOG_DIR, "push_subs.json")
+
+# ntfy (https://ntfy.sh) — opt-in, additive to Web Push. Setting a topic is all it takes.
+# Unlike Web Push this needs no VAPID keys, no service worker and no HTTPS on the relay, so it works
+# when the relay is only reachable over plain http on a private network.
+NTFY_TOPIC = os.environ.get("HERDR_NTFY_TOPIC", "").strip()
+NTFY_SERVER = os.environ.get("HERDR_NTFY_SERVER", "https://ntfy.sh").strip().rstrip("/")
+NTFY_TOKEN = os.environ.get("HERDR_NTFY_TOKEN", "").strip()
+NTFY_USER = os.environ.get("HERDR_NTFY_USER", "").strip()
+NTFY_PASSWORD = os.environ.get("HERDR_NTFY_PASSWORD", "")
+NTFY_PRIORITY = os.environ.get("HERDR_NTFY_PRIORITY", "high").strip()
+NTFY_TAGS = os.environ.get("HERDR_NTFY_TAGS", "sheep").strip()
+NTFY_TITLE_PREFIX = os.environ.get("HERDR_NTFY_TITLE_PREFIX", "").strip()
+# Public/tailnet base URL of the web app, used to make notifications tappable. Without it the
+# notification still arrives, just without a click target.
+NTFY_CLICK_BASE = os.environ.get("HERDR_NTFY_CLICK_BASE", "").strip().rstrip("/")
+# ntfy has no notification-replace primitive, so "agent unblocked" would be pure noise for most
+# people. Off unless asked for.
+NTFY_NOTIFY_RESOLVED = os.environ.get("HERDR_NTFY_NOTIFY_RESOLVED", "").lower() in ("1", "true", "yes")
+NTFY_RESOLVED_PRIORITY = os.environ.get("HERDR_NTFY_RESOLVED_PRIORITY", "low").strip()
+NTFY_TIMEOUT = float(os.environ.get("HERDR_NTFY_TIMEOUT", "5"))
+NTFY_ENABLED = bool(NTFY_TOPIC)
 
 # Remote hosts: comma-separated SSH targets
 REMOTES = [r.strip() for r in os.environ.get("HERDR_REMOTES", "").split(",") if r.strip()]
@@ -151,6 +172,102 @@ async def send_web_push(title: str, body: str, url: str = "/", clear: bool = Fal
         _save_push_subs()
 
 _load_push_subs()
+
+
+# --- ntfy (opt-in) ---
+def _ntfy_post_blocking(body: bytes, headers: dict):
+    import urllib.request
+    req = urllib.request.Request(f"{NTFY_SERVER}/{NTFY_TOPIC}", data=body, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    if NTFY_TOKEN:
+        req.add_header("Authorization", f"Bearer {NTFY_TOKEN}")
+    elif NTFY_USER:
+        import base64
+        cred = base64.b64encode(f"{NTFY_USER}:{NTFY_PASSWORD}".encode()).decode()
+        req.add_header("Authorization", f"Basic {cred}")
+    with urllib.request.urlopen(req, timeout=NTFY_TIMEOUT) as r:
+        return r.status
+
+
+async def send_ntfy(title: str, body: str, *, priority: str = "", tags: str = "", click: str = ""):
+    """Publish one notification to ntfy. No-op unless HERDR_NTFY_TOPIC is set.
+
+    Runs in a thread so a slow or unreachable ntfy server cannot stall the relay's event loop, and
+    never raises: a failed notification must not break the poll cycle.
+    """
+    if not NTFY_ENABLED:
+        return
+    full_title = f"{NTFY_TITLE_PREFIX} {title}".strip() if NTFY_TITLE_PREFIX else title
+    headers = {"Content-Type": "text/plain; charset=utf-8"}
+    if full_title:
+        # ntfy headers must be latin-1 safe; emoji belong in X-Tags, not the title.
+        headers["X-Title"] = full_title.encode("latin-1", "replace").decode("latin-1")
+    if priority or NTFY_PRIORITY:
+        headers["X-Priority"] = priority or NTFY_PRIORITY
+    if tags or NTFY_TAGS:
+        headers["X-Tags"] = tags or NTFY_TAGS
+    if click:
+        headers["X-Click"] = click
+    try:
+        status = await asyncio.to_thread(_ntfy_post_blocking, body.encode("utf-8"), headers)
+        log.debug("ntfy published (%s) to %s/%s", status, NTFY_SERVER, NTFY_TOPIC)
+    except Exception as e:
+        log.warning("ntfy publish failed (%s/%s): %s", NTFY_SERVER, NTFY_TOPIC, e)
+
+
+def _click_url(pane_id: str) -> str:
+    return f"{NTFY_CLICK_BASE}/?pane={pane_id}" if NTFY_CLICK_BASE else ""
+
+
+_BOX_CHARS = "─━═│┃┆┇┊┋┌┏┐┓└┗┘┛├┣┤┫┬┳┴┻┼╋╭╮╯╰╱╲╳▏▕█▌▐░▒▓"
+_BOX_TRANS = str.maketrans({c: " " for c in _BOX_CHARS})
+
+
+def notification_body(text: str, limit: int = 350) -> str:
+    """Flatten raw pane output into something readable on a lock screen.
+
+    read_pane() only drops lines made *entirely* of box-drawing characters, so TUI table rows still
+    arrive full of │ and ─. On a phone that is unreadable, so strip the glyphs and collapse runs of
+    whitespace, keeping the last lines — the prompt an agent is waiting on is at the bottom.
+    """
+    lines = []
+    for raw in text.translate(_BOX_TRANS).splitlines():
+        cleaned = " ".join(raw.split())
+        if cleaned:
+            lines.append(cleaned)
+    body = "\n".join(lines[-8:]).strip()
+    return body[:limit]
+
+
+# --- Notification dispatch ---
+async def notify_blocked(project: str, agent: str, host: str, pane_id: str, prompt: str):
+    """Fan out a 'needs you' notification over every configured channel."""
+    await send_web_push(
+        title=f"🐑 {project} blocked",
+        body=prompt[:120],
+        url=f"/?pane={pane_id}",
+    )
+    where = project or pane_id
+    if host and host != "local":
+        where = f"{where} @{host}"
+    await send_ntfy(
+        title=f"{where} needs you",
+        body=(notification_body(prompt) or f"{agent or 'agent'} is waiting for input"),
+        click=_click_url(pane_id),
+    )
+
+
+async def notify_resolved(project: str, pane_id: str):
+    await send_web_push("", "", clear=True)
+    if NTFY_NOTIFY_RESOLVED:
+        await send_ntfy(
+            title=f"{project or pane_id} unblocked",
+            body="Agent is running again.",
+            priority=NTFY_RESOLVED_PRIORITY,
+            tags="white_check_mark",
+            click=_click_url(pane_id),
+        )
 
 
 def _run_herdr_blocking(*args, remote=None):
@@ -275,15 +392,13 @@ async def _poll_once():
                     "prompt": content[:500],
                     "options": options or TOOL_OPTIONS
                 })
-                # Web Push notification
-                await send_web_push(
-                    title=f"🐑 {a['project']} blocked",
-                    body=content[:120],
-                    url=f"/?pane={pid}",
+                await notify_blocked(
+                    project=a["project"], agent=a["agent"],
+                    host=a.get("host", "local"), pane_id=pid, prompt=content,
                 )
-            # Send clear push when agent unblocks
+            # Notify when the agent unblocks (clears the Web Push, optional ntfy note)
             if status != "blocked" and last_statuses.get(pid) == "blocked":
-                await send_web_push("", "", clear=True)
+                await notify_resolved(a["project"], pid)
             last_statuses[pid] = status
         # Clean up panes that are no longer reported
         current_pane_ids = {a["pane_id"] for a in agents}
@@ -317,6 +432,15 @@ async def event_push():
                 "prompt": content[:500],
                 "options": options or TOOL_OPTIONS
             })
+            # Notify from here too — the plugin push is what makes this instant instead of waiting up
+            # to POLL_INTERVAL. Record the status so poll_loop does not notify for the same
+            # transition a second time.
+            if last_statuses.get(pane_id) != "blocked":
+                last_statuses[pane_id] = "blocked"
+                await notify_blocked(
+                    project=event.get("project", ""), agent=event.get("agent", ""),
+                    host=host, pane_id=pane_id, prompt=content,
+                )
 
         if pane_id and event.get("type") == "agent_event":
             await broadcast({
@@ -392,6 +516,10 @@ async def process_request(connection, request):
         body = json.dumps({
             "ok": True, "clients": len(clients), "agents": len(last_statuses),
             "hosts": ["local"] + REMOTES, "port": WS_PORT,
+            # Booleans only — an ntfy topic is a shared secret (anyone who knows it can read and
+            # publish to it), so it must never be served to clients.
+            "ntfy": NTFY_ENABLED,
+            "webPush": bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY),
         }).encode()
         return Response(200, "OK", _headers(("Content-Type", "application/json")), body)
 
@@ -401,6 +529,8 @@ async def process_request(connection, request):
         "/index.html": ("index.html", "text/html; charset=utf-8"),
         "/sw.js": ("sw.js", "application/javascript"),
         "/logo.svg": ("logo.svg", "image/svg+xml"),
+        # Browsers request /favicon.ico unprompted even when a <link rel=icon> is present.
+        "/favicon.ico": ("logo.svg", "image/svg+xml"),
     }
     if path in STATIC:
         name, ctype = STATIC[path]
@@ -614,6 +744,12 @@ async def main():
         log.info("Reachable at: http://%s:%d/  (ws://%s:%d)", ip, WS_PORT, ip, WS_PORT)
     if AUTH_TOKEN:
         log.info("Token auth enabled — clients must pass ?token=…")
+    if NTFY_ENABLED:
+        log.info("ntfy enabled: %s/%s (priority=%s tags=%s)", NTFY_SERVER, NTFY_TOPIC, NTFY_PRIORITY, NTFY_TAGS)
+    else:
+        log.info("ntfy disabled (set HERDR_NTFY_TOPIC to enable)")
+    if VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY:
+        log.info("Web Push enabled (%d subscription(s))", len(push_subscriptions))
     stop = loop.create_future()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set_result, None)

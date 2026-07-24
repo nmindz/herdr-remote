@@ -79,6 +79,44 @@ anything. If Herdi sits on "Disconnected" against a non-loopback relay, enable i
 **System Settings ▸ Privacy & Security ▸ Local Network**. Loopback (`ws://127.0.0.1:8375`) is exempt
 and works without any grant.
 
+### Notifications over ntfy (opt-in)
+
+[ntfy](https://ntfy.sh) sidesteps the HTTPS problem entirely: the relay POSTs to an ntfy server and
+your phone gets a real push notification through the ntfy app, with the tab closed and no TLS on the
+relay. Web Push remains the default; ntfy is additive and off until you set a topic.
+
+```bash
+export HERDR_NTFY_TOPIC="herdr-a8f3c1b90d2e"   # the only required setting
+uv run relay/herdr_relay.py
+```
+
+Subscribe to the same topic in the ntfy app. On startup the relay confirms the channel:
+
+```
+ntfy enabled: https://ntfy.sh/herdr-a8f3c1b90d2e (priority=high tags=sheep)
+```
+
+> On a public server the topic name is the only thing protecting it — anyone who knows it can read
+> and publish. Use a long random topic, or self-host with auth.
+
+Everything else is optional:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HERDR_NTFY_TOPIC` | — | Topic to publish to. **Setting it enables ntfy.** |
+| `HERDR_NTFY_SERVER` | `https://ntfy.sh` | Self-hosted server URL |
+| `HERDR_NTFY_TOKEN` | — | Access token (`tk_…`) |
+| `HERDR_NTFY_USER` / `_PASSWORD` | — | Basic auth, as an alternative to the token |
+| `HERDR_NTFY_PRIORITY` | `high` | `min`, `low`, `default`, `high`, `urgent` |
+| `HERDR_NTFY_TAGS` | `sheep` | Comma-separated ntfy emoji shortcodes |
+| `HERDR_NTFY_TITLE_PREFIX` | — | Prepended to every title |
+| `HERDR_NTFY_CLICK_BASE` | — | Web app base URL, makes notifications tappable |
+| `HERDR_NTFY_NOTIFY_RESOLVED` | off | Also notify when an agent unblocks |
+| `HERDR_NTFY_RESOLVED_PRIORITY` | `low` | Priority for those resolved messages |
+| `HERDR_NTFY_TIMEOUT` | `5` | Seconds before giving up on the ntfy server |
+
+A failed or slow ntfy publish is logged and ignored — it never delays polling or breaks a client.
+
 ### Wiring up push events (optional)
 
 Polling every 2s already keeps clients current; the plugin only makes status changes instant. The

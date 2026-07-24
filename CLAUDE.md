@@ -68,6 +68,8 @@ cd herdi-ios && xcodegen generate
 | `HERDR_REMOTES` | Comma-separated SSH targets to poll |
 | `HERDR_BIN` | Path to herdr binary (default: `/opt/homebrew/bin/herdr`) |
 | `HERDR_RELAY` | Relay URL used by clients (default: `ws://127.0.0.1:8375`) |
+| `HERDR_TUNNEL_MODE` | `temp` (default), `named`, or `none` to skip cloudflared entirely |
+| `HERDR_NTFY_TOPIC` | Enables opt-in ntfy notifications; see `relay/.env.example` for the rest |
 
 ## Web App
 
