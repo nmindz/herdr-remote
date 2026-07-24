@@ -153,7 +153,7 @@ async def send_web_push(title: str, body: str, url: str = "/", clear: bool = Fal
 _load_push_subs()
 
 
-def run_herdr(*args, remote=None):
+def _run_herdr_blocking(*args, remote=None):
     try:
         if remote:
             cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", remote, HERDR, *args]
@@ -165,8 +165,18 @@ def run_herdr(*args, remote=None):
         return ""
 
 
-def get_agents_from_host(remote=None):
-    raw = run_herdr("pane", "list", remote=remote)
+async def run_herdr(*args, remote=None):
+    """Run herdr off the event loop.
+
+    subprocess.run blocks the calling thread. Called directly from a coroutine it would freeze the
+    single-threaded event loop for up to its 15s timeout — long enough for websockets' keepalive to
+    time out and drop every connected client at once (an unreachable SSH remote does this reliably).
+    """
+    return await asyncio.to_thread(_run_herdr_blocking, *args, remote=remote)
+
+
+async def get_agents_from_host(remote=None):
+    raw = await run_herdr("pane", "list", remote=remote)
     host_label = remote or "local"
     try:
         data = json.loads(raw)
@@ -190,15 +200,25 @@ def get_agents_from_host(remote=None):
         return []
 
 
-def get_all_agents():
-    agents = get_agents_from_host(remote=None)
-    for remote in REMOTES:
-        agents.extend(get_agents_from_host(remote=remote))
+async def get_all_agents():
+    # Poll every host concurrently: serially, one unreachable remote would add its full timeout to
+    # every poll cycle and stall the whole relay.
+    results = await asyncio.gather(
+        get_agents_from_host(remote=None),
+        *(get_agents_from_host(remote=r) for r in REMOTES),
+        return_exceptions=True,
+    )
+    agents = []
+    for host, res in zip(["local"] + REMOTES, results):
+        if isinstance(res, BaseException):
+            log.warning("Polling %s failed: %s", host, res)
+            continue
+        agents.extend(res)
     return agents
 
 
-def read_pane(pane_id, remote=None):
-    raw = run_herdr("pane", "read", pane_id, "--lines", "50", "--source", "recent", remote=remote)
+async def read_pane(pane_id, remote=None):
+    raw = await run_herdr("pane", "read", pane_id, "--lines", "50", "--source", "recent", remote=remote)
     lines = [l for l in raw.splitlines() if l.strip() and not CHROME_RE.search(l)]
     return "\n".join(lines[-20:])
 
@@ -237,7 +257,7 @@ async def poll_loop():
 
 
 async def _poll_once():
-        agents = get_all_agents()
+        agents = await get_all_agents()
         # Always broadcast (even empty list) so clients stay in sync
         for a in agents:
             pane_remote_map[a["pane_id"]] = a.get("remote")
@@ -246,7 +266,7 @@ async def _poll_once():
         for a in agents:
             pid, status = a["pane_id"], a["status"]
             if status == "blocked" and last_statuses.get(pid) != "blocked":
-                content = read_pane(pid, remote=a.get("remote"))
+                content = await read_pane(pid, remote=a.get("remote"))
                 options = detect_options(content)
                 await broadcast({
                     "type": "blocked", "pane_id": pid,
@@ -285,7 +305,7 @@ async def event_push():
         if status == "blocked" and pane_id:
             remote = pane_remote_map.get(pane_id)
             if remote or host == "local":
-                content = read_pane(pane_id, remote=remote)
+                content = await read_pane(pane_id, remote=remote)
             else:
                 content = event.get("prompt", "Agent is blocked")
             options = detect_options(content)
@@ -340,63 +360,17 @@ async def process_request(connection, request):
     if upgrade == "websocket":
         return None  # proceed with WebSocket handshake
 
-    # For CORS preflight
-    if request.path and "OPTIONS" in str(request.headers):
-        headers = Headers([
-            ("Access-Control-Allow-Origin", "*"),
-            ("Access-Control-Allow-Methods", "POST, OPTIONS"),
-            ("Access-Control-Allow-Headers", "Content-Type"),
-        ])
-        return Response(204, "No Content", headers, b"")
-
-    # Serve web app for GET / or GET /index.html
+    # NOTE: websockets' Request exposes only .path and .headers — there is no .method — so a CORS
+    # preflight cannot be distinguished here. Instead of guessing, every response below carries
+    # permissive CORS headers.
     path = (request.path or "/").split("?")[0]
-    if path in ("/", "/index.html"):
-        web_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web")
-        index_path = os.path.join(web_dir, "index.html")
-        if os.path.isfile(index_path):
-            with open(index_path, "rb") as f:
-                body = f.read()
-            headers = Headers([
-                ("Content-Type", "text/html; charset=utf-8"),
-                ("Cache-Control", "no-cache"),
-            ])
-            return Response(200, "OK", headers, body)
+    def _headers(*pairs):
+        return Headers([*pairs, ("Access-Control-Allow-Origin", "*"),
+                        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+                        ("Access-Control-Allow-Headers", "Content-Type, Authorization")])
 
-    # Serve service worker
-    if path == "/sw.js":
-        web_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web")
-        sw_path = os.path.join(web_dir, "sw.js")
-        if os.path.isfile(sw_path):
-            with open(sw_path, "rb") as f:
-                body = f.read()
-            headers = Headers([
-                ("Content-Type", "application/javascript"),
-                ("Cache-Control", "no-cache"),
-                ("Service-Worker-Allowed", "/"),
-            ])
-            return Response(200, "OK", headers, body)
-
-    # Serve VAPID public key
-    if path == "/api/vapid-public-key":
-        body = json.dumps({"publicKey": VAPID_PUBLIC_KEY}).encode()
-        headers = Headers([
-            ("Content-Type", "application/json"),
-            ("Access-Control-Allow-Origin", "*"),
-        ])
-        return Response(200, "OK", headers, body)
-
-    # Serve logo.svg
-    if path == "/logo.svg":
-        web_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web")
-        svg_path = os.path.join(web_dir, "logo.svg")
-        if os.path.isfile(svg_path):
-            with open(svg_path, "rb") as f:
-                body = f.read()
-            headers = Headers([("Content-Type", "image/svg+xml")])
-            return Response(200, "OK", headers, body)
-
-    # HTTP POST — parse event from URL query params as fallback
+    # Event push (herdr-push POSTs to /push?d=<urlencoded json>). Checked before static routing so
+    # it keeps working regardless of the path the plugin is configured with.
     import urllib.parse
     if "?" in (request.path or ""):
         _, qs = request.path.split("?", 1)
@@ -406,10 +380,45 @@ async def process_request(connection, request):
                 event = json.loads(urllib.parse.unquote(params["d"][0]))
                 event_queue.put_nowait(event)
             except Exception:
-                pass
+                log.warning("Dropped malformed push event on %s", path)
+                return Response(400, "Bad Request", _headers(), b"bad event\n")
+            return Response(200, "OK", _headers(), b"ok\n")
 
-    headers = Headers([("Access-Control-Allow-Origin", "*")])
-    return Response(200, "OK", headers, b"ok\n")
+    if path == "/api/vapid-public-key":
+        body = json.dumps({"publicKey": VAPID_PUBLIC_KEY}).encode()
+        return Response(200, "OK", _headers(("Content-Type", "application/json")), body)
+
+    if path == "/healthz":
+        body = json.dumps({
+            "ok": True, "clients": len(clients), "agents": len(last_statuses),
+            "hosts": ["local"] + REMOTES, "port": WS_PORT,
+        }).encode()
+        return Response(200, "OK", _headers(("Content-Type", "application/json")), body)
+
+    # Static files out of ../web
+    STATIC = {
+        "/": ("index.html", "text/html; charset=utf-8"),
+        "/index.html": ("index.html", "text/html; charset=utf-8"),
+        "/sw.js": ("sw.js", "application/javascript"),
+        "/logo.svg": ("logo.svg", "image/svg+xml"),
+    }
+    if path in STATIC:
+        name, ctype = STATIC[path]
+        web_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web")
+        file_path = os.path.join(web_dir, name)
+        if os.path.isfile(file_path):
+            with open(file_path, "rb") as f:
+                body = f.read()
+            extra = [("Content-Type", ctype), ("Cache-Control", "no-cache")]
+            if path == "/sw.js":
+                extra.append(("Service-Worker-Allowed", "/"))
+            return Response(200, "OK", _headers(*extra), body)
+        log.warning("Static file missing: %s", file_path)
+        return Response(404, "Not Found", _headers(("Content-Type", "text/plain")), b"not found\n")
+
+    # Anything else really is not found. Returning 200 "ok" here (the previous behaviour) made every
+    # missing asset look like a success to browsers and hid real 404s.
+    return Response(404, "Not Found", _headers(("Content-Type", "text/plain")), b"not found\n")
 
 
 async def handle_client(ws):
@@ -457,7 +466,7 @@ async def handle_client(ws):
                 remote = pane_remote_map.get(pane_id)
                 log.info("Response from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
                 audit("respond", ip, device, pane_id, f"text={text!r}")
-                run_herdr("pane", "send-text", pane_id, text + "\n", remote=remote)
+                await run_herdr("pane", "send-text", pane_id, text + "\n", remote=remote)
             elif msg_type == "agent_event":
                 event_queue.put_nowait(msg)
             elif msg_type == "read_pane":
@@ -467,7 +476,7 @@ async def handle_client(ws):
                     continue
                 lines = msg.get("lines", "30")
                 remote = pane_remote_map.get(pane_id)
-                content = run_herdr("pane", "read", pane_id, "--lines", str(lines), "--source", "recent", remote=remote)
+                content = await run_herdr("pane", "read", pane_id, "--lines", str(lines), "--source", "recent", remote=remote)
                 await ws.send(json.dumps({"type": "pane_content", "pane_id": pane_id, "content": content}))
             elif msg_type == "send_keys":
                 pane_id = msg["pane_id"]
@@ -481,7 +490,7 @@ async def handle_client(ws):
                 remote = pane_remote_map.get(pane_id)
                 log.info("Keys from %s (%s): pane=%s keys=%s", ip, device, pane_id, keys)
                 audit("send_keys", ip, device, pane_id, f"keys={keys}")
-                run_herdr("pane", "send-keys", pane_id, *keys, remote=remote)
+                await run_herdr("pane", "send-keys", pane_id, *keys, remote=remote)
             elif msg_type == "send_text":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:
@@ -494,13 +503,13 @@ async def handle_client(ws):
                 remote = pane_remote_map.get(pane_id)
                 log.info("Text from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
                 audit("send_text", ip, device, pane_id, f"text={text!r}")
-                run_herdr("pane", "send-text", pane_id, text, remote=remote)
+                await run_herdr("pane", "send-text", pane_id, text, remote=remote)
             elif msg_type == "create_tab":
                 workspace_id = msg.get("workspace_id", "")
                 if workspace_id:
                     log.info("Create tab from %s (%s): workspace=%s", ip, device, workspace_id)
                     audit("create_tab", ip, device, "", f"workspace={workspace_id}")
-                    run_herdr("tab", "create", "--workspace", workspace_id, "--focus")
+                    await run_herdr("tab", "create", "--workspace", workspace_id, "--focus")
                     await ws.send(json.dumps({"type": "tab_created", "ok": True}))
                 else:
                     await ws.send(json.dumps({"type": "error", "message": "workspace_id required"}))
@@ -533,19 +542,47 @@ class UDPPlugin(asyncio.DatagramProtocol):
             pass
 
 
+def local_ips():
+    """Best-effort list of this host's routable IPv4 addresses, most useful first.
+
+    gethostbyname(gethostname()) is not usable for this: on macOS the machine's hostname often has no
+    resolvable A record, which raises "nodename nor servname provided". Opening a UDP socket toward a
+    peer instead asks the routing table which source address would be used — no DNS, no traffic sent.
+    """
+    ips = []
+
+    def _probe(peer):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((peer, 80))
+            return s.getsockname()[0]
+        except OSError:
+            return None
+        finally:
+            s.close()
+
+    for peer in ("100.100.100.100", "8.8.8.8"):  # Tailscale's MagicDNS anycast IP, then the internet
+        ip = _probe(peer)
+        if ip and ip not in ips and not ip.startswith("127."):
+            ips.append(ip)
+    return ips
+
+
 def start_mdns():
     try:
         from zeroconf import Zeroconf, ServiceInfo
-        import socket as sock_mod
         import threading
-        ip = sock_mod.gethostbyname(sock_mod.gethostname())
+        ips = local_ips()
+        if not ips:
+            log.warning("mDNS skipped: no routable IPv4 address found")
+            return None, None
         info = ServiceInfo(
             "_herdr-remote._tcp.local.", "herdr-remote._herdr-remote._tcp.local.",
-            addresses=[sock_mod.inet_aton(ip)], port=WS_PORT,
+            addresses=[socket.inet_aton(ip) for ip in ips], port=WS_PORT,
         )
         zc = Zeroconf()
         threading.Thread(target=zc.register_service, args=(info,), daemon=True).start()
-        log.info("mDNS registering at %s", ip)
+        log.info("mDNS registering at %s", ", ".join(ips))
         return zc, info
     except Exception as e:
         log.warning("mDNS skipped: %s", e)
@@ -561,10 +598,22 @@ async def main():
         log.warning("UDP 8376 in use, plugin push disabled")
     asyncio.create_task(poll_loop())
     asyncio.create_task(event_push())
-    server = await serve(handle_client, "0.0.0.0", WS_PORT, process_request=process_request)
+    server = await serve(
+        handle_client, "0.0.0.0", WS_PORT,
+        process_request=process_request,
+        # Keep clients alive across a slow herdr/ssh call rather than dropping them: a missed pong
+        # used to tear down every connection at once and show up as connect/disconnect churn.
+        ping_interval=20,
+        ping_timeout=60,
+        max_queue=64,
+    )
     hosts = ["local"] + REMOTES
-    log.info("herdr-remote relay on :%d (WebSocket + HTTP POST)", WS_PORT)
+    log.info("herdr-remote relay on :%d (WebSocket + HTTP)", WS_PORT)
     log.info("Polling: %s", ", ".join(hosts))
+    for ip in local_ips():
+        log.info("Reachable at: http://%s:%d/  (ws://%s:%d)", ip, WS_PORT, ip, WS_PORT)
+    if AUTH_TOKEN:
+        log.info("Token auth enabled — clients must pass ?token=…")
     stop = loop.create_future()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set_result, None)

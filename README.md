@@ -44,6 +44,50 @@ cd herdr-remote/relay && ./start.sh
 
 Open [herdr-demo.pages.dev](https://herdr-demo.pages.dev) on your phone, paste the tunnel URL.
 
+### Private network only (Tailscale / LAN, no tunnel)
+
+The relay binds `0.0.0.0` and serves the web app itself, so no tunnel is needed if the devices
+already share a private network. Skip cloudflared entirely:
+
+```bash
+HERDR_TUNNEL_MODE=none uv run relay/herdr_relay.py
+```
+
+On startup it prints every address it is reachable on:
+
+```
+Reachable at: http://<tailscale-ip>:8375/  (ws://<tailscale-ip>:8375)
+```
+
+Open that `http://…:8375/` URL on any device on the tailnet — the page auto-connects back to the
+relay it was served from, so there is nothing to paste into Settings.
+
+Two things to know about running without TLS:
+
+- **Web Push needs HTTPS.** Over plain http the browser disables service workers, so background push
+  is unavailable. Live notifications still work while the tab is open. Put TLS in front of the relay
+  (e.g. `tailscale serve`) if you want background push.
+- **Don't paste a `ws://` URL into an `https://` page.** A page loaded from Cloudflare Pages cannot
+  open a cleartext WebSocket — browsers block it as mixed content. Open the relay's own address
+  instead.
+
+### macOS: grant Herdi "Local Network" access
+
+macOS 15+ silently blocks apps from reaching LAN and Tailscale (`100.64.0.0/10`) addresses until you
+approve them, and `URLSession` reports **no error** when it does — the app just never receives
+anything. If Herdi sits on "Disconnected" against a non-loopback relay, enable it under
+**System Settings ▸ Privacy & Security ▸ Local Network**. Loopback (`ws://127.0.0.1:8375`) is exempt
+and works without any grant.
+
+### Wiring up push events (optional)
+
+Polling every 2s already keeps clients current; the plugin only makes status changes instant. The
+`herdr-push` plugin exits silently unless `HERDR_RELAY` is set in its config:
+
+```bash
+echo 'HERDR_RELAY=http://127.0.0.1:8375' >> ~/.config/herdr/plugins/config/herdr.push/.env
+```
+
 ## Telegram Bot
 
 Full agent interaction:

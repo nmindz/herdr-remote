@@ -2,13 +2,51 @@ import Foundation
 import Network
 import Observation
 import UserNotifications
+import os.log
+
+private let log = Logger(subsystem: "com.herdr.herdi", category: "Relay")
 
 @Observable
 final class RelayConnection {
     var agents: [Agent] = []
     var isConnected = false
-    var hostAddress = "ws://127.0.0.1:8375"
+    var hostAddress = RelayConnection.savedHostAddress() {
+        didSet { UserDefaults.standard.set(hostAddress, forKey: "herdi_relay_host") }
+    }
     var mode: ConnectionMode = .direct
+
+    /// Relay URL precedence: what the user last saved, then HERDR_RELAY, then loopback.
+    /// Accepts a bare host ("127.0.0.1:8375", "my-mac.ts.net") and fills in the scheme/port.
+    static func savedHostAddress() -> String {
+        let raw = UserDefaults.standard.string(forKey: "herdi_relay_host")
+            ?? ProcessInfo.processInfo.environment["HERDR_RELAY"]
+            ?? "ws://127.0.0.1:8375"
+        return normalizeRelayURL(raw)
+    }
+
+    static func normalizeRelayURL(_ input: String) -> String {
+        var s = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "ws://127.0.0.1:8375" }
+        if s.hasPrefix("http://") { s = "ws://" + s.dropFirst("http://".count) }
+        else if s.hasPrefix("https://") { s = "wss://" + s.dropFirst("https://".count) }
+        else if !s.hasPrefix("ws://") && !s.hasPrefix("wss://") { s = "ws://" + s }
+        // Append the default port when the authority has none (ignoring any path).
+        let schemeSplit = s.components(separatedBy: "://")
+        if schemeSplit.count == 2 {
+            let scheme = schemeSplit[0]
+            var authority = schemeSplit[1]
+            var path = ""
+            if let slash = authority.firstIndex(of: "/") {
+                path = String(authority[slash...])
+                authority = String(authority[..<slash])
+            }
+            if !authority.contains(":") && scheme == "ws" {
+                authority += ":8375"
+            }
+            s = "\(scheme)://\(authority)\(path)"
+        }
+        return s
+    }
 
     enum ConnectionMode: String, CaseIterable {
         case direct = "Direct (herdr CLI)"
@@ -20,6 +58,8 @@ final class RelayConnection {
     private var pollTimer: Timer?
     private var reconnectAttempt = 0
     private var reconnecting = false
+    private var handshakeWatchdog: Timer?
+    var lastError: String?
     private let herdrPath: String
     var remotes: [String] = [] // SSH targets, e.g. ["user@host"]
 
@@ -30,13 +70,25 @@ final class RelayConnection {
         if let saved = UserDefaults.standard.stringArray(forKey: "herdi_remotes") {
             remotes = saved
         }
-        startDirect()
+        // Restore the mode the user last chose; previously the app always came back in Direct mode,
+        // so a configured relay was silently ignored on every launch.
+        let savedMode = UserDefaults.standard.string(forKey: "herdi_mode")
+        log.info("Herdi starting — savedMode=\(savedMode ?? "nil", privacy: .public) host=\(self.hostAddress, privacy: .public)")
+        if savedMode == ConnectionMode.relay.rawValue {
+            connectRelay(to: hostAddress)
+        } else {
+            startDirect()
+        }
     }
 
     // MARK: - Direct Mode (polls herdr CLI)
 
     func startDirect() {
         mode = .direct
+        UserDefaults.standard.set(mode.rawValue, forKey: "herdi_mode")
+        handshakeWatchdog?.invalidate()
+        handshakeWatchdog = nil
+        lastError = nil
         task?.cancel(with: .normalClosure, reason: nil)
         pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -196,22 +248,50 @@ final class RelayConnection {
     // MARK: - Relay Mode (WebSocket)
 
     func connectRelay(to urlString: String) {
-        guard let url = URL(string: urlString) else { return }
+        let normalized = RelayConnection.normalizeRelayURL(urlString)
+        guard let url = URL(string: normalized), url.host != nil else {
+            lastError = "Invalid relay URL: \(urlString)"
+            return
+        }
+        log.info("Connecting to relay \(normalized, privacy: .public)")
         mode = .relay
-        hostAddress = urlString
+        UserDefaults.standard.set(mode.rawValue, forKey: "herdi_mode")
+        hostAddress = normalized
         pollTimer?.invalidate()
         pollTimer = nil
         reconnecting = false
         task?.cancel(with: .normalClosure, reason: nil)
         task = session.webSocketTask(with: url)
         task?.resume()
-        reconnectAttempt = 0
+        // NOTE: reconnectAttempt is deliberately NOT reset here. This method is also the retry entry
+        // point from scheduleReconnect(), so resetting it would flatten the backoff to a fixed ~2s and
+        // hammer an unreachable relay forever. It resets in listen() once a message actually arrives.
+        startHandshakeWatchdog(for: normalized)
         listen()
+    }
+
+    /// URLSessionWebSocketTask does not report an error when macOS blocks the connection — notably
+    /// when Local Network privacy denies access to a LAN / Tailscale (100.64.0.0/10) address. The
+    /// receive handler simply never fires, so the app looks connected-but-idle forever. Time it out
+    /// and say what to check.
+    private func startHandshakeWatchdog(for target: String) {
+        handshakeWatchdog?.invalidate()
+        let isLoopback = target.contains("127.0.0.1") || target.contains("localhost") || target.contains("[::1]")
+        handshakeWatchdog = Timer.scheduledTimer(withTimeInterval: 12.0, repeats: false) { [weak self] _ in
+            guard let self, !self.isConnected, self.mode == .relay else { return }
+            self.lastError = isLoopback
+                ? "No response from \(target) — is the relay running? (relay/start.sh)"
+                : "No response from \(target). If the relay is running, grant Herdi access in System Settings ▸ Privacy & Security ▸ Local Network — macOS blocks LAN/Tailscale connections silently."
+            log.error("Handshake watchdog fired for \(target, privacy: .public)")
+            self.scheduleReconnect()
+        }
     }
 
     func disconnect() {
         task?.cancel(with: .normalClosure, reason: nil)
         pollTimer?.invalidate()
+        handshakeWatchdog?.invalidate()
+        handshakeWatchdog = nil
         isConnected = false
     }
 
@@ -250,16 +330,23 @@ final class RelayConnection {
             guard let self else { return }
             switch result {
             case .success(let message):
-                DispatchQueue.main.async { if !self.isConnected { self.isConnected = true } }
+                DispatchQueue.main.async {
+                    if !self.isConnected { self.isConnected = true }
+                    self.reconnectAttempt = 0  // a real message proves the relay is healthy
+                    self.lastError = nil
+                    self.handshakeWatchdog?.invalidate()
+                    self.handshakeWatchdog = nil
+                }
                 switch message {
                 case .string(let text): self.handleWS(text)
                 case .data(let data): self.handleWS(String(data: data, encoding: .utf8) ?? "")
                 @unknown default: break
                 }
                 self.listen()
-            case .failure:
+            case .failure(let error):
                 DispatchQueue.main.async {
                     self.isConnected = false
+                    self.lastError = "\(self.hostAddress): \(error.localizedDescription)"
                     self.scheduleReconnect()
                 }
             }

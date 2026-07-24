@@ -22,6 +22,21 @@ private class NotchHostingView<Content: View>: NSHostingView<Content> {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    // The deferred `super` assignments live in dedicated methods: Swift 6 rejects referencing `super`
+    // inside a closure that explicitly captures self ("using 'super' in a closure where 'self' is
+    // explicitly captured is not yet supported"), which broke the build outright.
+    private func applyDeferred(needsUpdateConstraints value: Bool) {
+        applyingDeferred = true
+        super.needsUpdateConstraints = value
+        applyingDeferred = false
+    }
+
+    private func applyDeferred(needsLayout value: Bool) {
+        applyingDeferred = true
+        super.needsLayout = value
+        applyingDeferred = false
+    }
+
     override var needsUpdateConstraints: Bool {
         get { super.needsUpdateConstraints }
         set {
@@ -30,10 +45,7 @@ private class NotchHostingView<Content: View>: NSHostingView<Content> {
                 return
             }
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.applyingDeferred = true
-                super.needsUpdateConstraints = newValue
-                self.applyingDeferred = false
+                self?.applyDeferred(needsUpdateConstraints: newValue)
             }
         }
     }
@@ -46,10 +58,7 @@ private class NotchHostingView<Content: View>: NSHostingView<Content> {
                 return
             }
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.applyingDeferred = true
-                super.needsLayout = newValue
-                self.applyingDeferred = false
+                self?.applyDeferred(needsLayout: newValue)
             }
         }
     }

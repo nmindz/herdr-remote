@@ -150,11 +150,11 @@ body { font-family: -apple-system, system-ui, -webkit-system-font, sans-serif; b
   <h2>Settings</h2>
   <div class="setting-group">
     <label for="relayUrl">Relay URL</label>
-    <input id="relayUrl" type="url" placeholder="wss://your-tunnel.trycloudflare.com" />
+    <input id="relayUrl" type="url" placeholder="ws://100.x.y.z:8375 or wss://your-tunnel…" />
     <label for="relayToken" style="margin-top:8px">Token (optional)</label>
     <input id="relayToken" type="password" placeholder="shared secret" />
     <button onclick="saveAndConnect()">Connect</button>
-    <div class="hint">Run <code>./relay/start.sh</code> to get a URL. <a href="https://github.com/dcolinmorgan/herdr-remote/blob/main/QUICKSTART.md" style="color:var(--blue)">Setup guide →</a></div>
+    <div class="hint">Leave blank when you opened this page from the relay itself — it auto-connects to the same host. For a Tailscale-only relay use <code>ws://&lt;tailscale-ip&gt;:8375</code>; an <code>https</code> page cannot use <code>ws://</code>. <a href="https://github.com/dcolinmorgan/herdr-remote/blob/main/QUICKSTART.md" style="color:var(--blue)">Setup guide →</a></div>
   </div>
 
   <div class="setting-group">
@@ -276,7 +276,12 @@ let activeTab = null;
 const autoRelayUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
 const DEMO_RELAY = 'wss://herdr-remote-demo.yyrzrh5wfg.workers.dev';
 const isDemo = location.hostname.includes('herdr-demo.pages.dev');
-const isSelfRelay = !isDemo && !location.hostname.includes('pages.dev') && !location.hostname.includes('localhost');
+// The relay serves this page itself, so any http(s) origin that isn't the demo or a Pages deploy is
+// its own relay — including localhost and Tailscale IPs / *.ts.net names.
+const isSelfRelay = !isDemo
+  && (location.protocol === 'http:' || location.protocol === 'https:')
+  && !!location.host
+  && !location.hostname.includes('pages.dev');
 const savedUrl = localStorage.getItem('herdr_relay_url') || (isSelfRelay ? autoRelayUrl : (isDemo ? DEMO_RELAY : ''));
 const urlToken = new URLSearchParams(location.search).get('token');
 if (urlToken) localStorage.setItem('herdr_relay_token', urlToken);
@@ -330,20 +335,85 @@ function saveAndConnect() {
 }
 
 // Connection
+// wsGeneration invalidates the handlers of superseded sockets. Without it, the `ws.close()` below
+// fired the *old* socket's onclose, which scheduled another connect(), which closed the new healthy
+// socket 3s later — a self-sustaining connect/disconnect loop that never recovered.
+let wsGeneration = 0;
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+
 function connect() {
   let url = localStorage.getItem('herdr_relay_url') || (isSelfRelay ? autoRelayUrl : (isDemo ? DEMO_RELAY : ''));
   if (!url) { showSetup(); return; }
-  if (ws) ws.close();
+
+  // A page loaded over https cannot open a plaintext ws:// socket — the browser blocks it as mixed
+  // content before any connection is attempted, so retrying can never succeed.
+  if (location.protocol === 'https:' && url.startsWith('ws://')) {
+    setStatus('disconnected');
+    showMixedContentHelp(url);
+    return;
+  }
+
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
+  const gen = ++wsGeneration;
+  if (ws) {
+    ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null; // orphan the old socket's handlers
+    try { ws.close(); } catch (e) {}
+  }
   setStatus('connecting');
   // Append token as query param if stored separately
   const token = localStorage.getItem('herdr_relay_token');
   let wsUrl = url;
   if (token) wsUrl += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
-  ws = new WebSocket(wsUrl);
-  ws.onopen = () => { setStatus('connected'); if(window.cue) cue('ready'); };
-  ws.onclose = () => { setStatus('disconnected'); setTimeout(connect, 3000); };
-  ws.onerror = () => setStatus('disconnected');
-  ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
+
+  let sock;
+  try {
+    sock = new WebSocket(wsUrl);
+  } catch (e) {
+    setStatus('disconnected');
+    scheduleReconnect(gen);
+    return;
+  }
+  ws = sock;
+  sock.onopen = () => {
+    if (gen !== wsGeneration) return;
+    reconnectDelay = 1000;
+    setStatus('connected');
+    if (window.cue) cue('ready');
+  };
+  sock.onclose = () => {
+    if (gen !== wsGeneration) return; // superseded by a newer connect(); do not reconnect
+    setStatus('disconnected');
+    scheduleReconnect(gen);
+  };
+  sock.onerror = () => { if (gen === wsGeneration) setStatus('disconnected'); };
+  sock.onmessage = (e) => {
+    if (gen !== wsGeneration) return;
+    try { handleMessage(JSON.parse(e.data)); } catch (err) {}
+  };
+}
+
+function scheduleReconnect(gen) {
+  if (gen !== wsGeneration || reconnectTimer) return;
+  const delay = reconnectDelay;
+  reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
+}
+
+function showMixedContentHelp(url) {
+  document.getElementById('agents').innerHTML = `<div class="empty">
+    <p style="font-size:1.5rem;margin-bottom:12px">🔒</p>
+    <p><strong>Blocked: insecure connection</strong></p>
+    <p style="margin-top:8px;font-size:0.8rem;color:var(--muted);max-width:320px;margin-left:auto;margin-right:auto">
+      This page is served over <strong>https</strong>, so your browser refuses to open
+      <code style="font-size:0.7rem">${url.replace(/</g,'&lt;')}</code> (plain <code>ws://</code>).
+    </p>
+    <p style="margin-top:12px;font-size:0.8rem;color:var(--muted);max-width:320px;margin-left:auto;margin-right:auto">
+      Open the relay's own address directly instead — the relay serves this same app:<br>
+      <code style="font-size:0.7rem">http://&lt;tailscale-ip-or-host&gt;:8375/</code>
+    </p>
+  </div>`;
 }
 
 function setStatus(s) {
@@ -363,7 +433,8 @@ function showSetup() {
     <p style="margin-top:16px;font-size:0.75rem;color:var(--muted);text-align:left;max-width:280px;margin-left:auto;margin-right:auto">
       <strong>Connect your own:</strong><br>
       1. Run: <code style="font-size:0.7rem">cd relay && ./start.sh</code><br>
-      2. Tap ⚙ → paste the wss:// URL<br>
+      2. Open <code style="font-size:0.7rem">http://&lt;host&gt;:8375/</code> — the relay serves this app and auto-connects<br>
+      3. Or tap ⚙ and paste a <code style="font-size:0.7rem">ws://</code> / <code style="font-size:0.7rem">wss://</code> URL<br>
     </p>
   </div>`;
 }
@@ -798,6 +869,14 @@ function runCommand(cmd) {
 let pushSubscription = null;
 
 async function initPush() {
+  // Service workers and push are gated behind a secure context. Serving the relay over plain http on
+  // a Tailscale IP or *.ts.net name is not one, so report the real cause instead of blaming the browser.
+  if (!window.isSecureContext) {
+    document.getElementById('pushStatus').textContent =
+      'Push needs HTTPS — unavailable over plain http (e.g. a Tailscale IP). Notifications still work while this tab is open.';
+    document.getElementById('pushToggle').style.display = 'none';
+    return;
+  }
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
     document.getElementById('pushStatus').textContent = 'Push not supported in this browser';
     document.getElementById('pushToggle').style.display = 'none';

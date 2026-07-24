@@ -72,10 +72,20 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
         relayItem.state = relay.mode == .relay ? .on : .off
         menu.addItem(relayItem)
 
+        let urlItem = NSMenuItem(title: "  Relay URL: \(relay.hostAddress)…", action: #selector(editRelayURL), keyEquivalent: "")
+        urlItem.target = self
+        menu.addItem(urlItem)
+
+        if let err = relay.lastError, relay.mode == .relay, !relay.isConnected {
+            let errItem = NSMenuItem(title: "  ⚠ \(err)", action: nil, keyEquivalent: "")
+            errItem.isEnabled = false
+            menu.addItem(errItem)
+        }
+
         menu.addItem(.separator())
 
         // Remotes
-        let remotesHeader = NSMenuItem(title: "Remote Hosts", action: nil, keyEquivalent: "")
+        let remotesHeader = NSMenuItem(title: "Remote Hosts (SSH)", action: nil, keyEquivalent: "")
         remotesHeader.isEnabled = false
         menu.addItem(remotesHeader)
 
@@ -86,10 +96,19 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
         } else {
             for remote in relay.remotes {
                 let item = NSMenuItem(title: "  \(remote)", action: nil, keyEquivalent: "")
-                item.isEnabled = false
+                let sub = NSMenu()
+                let removeItem = NSMenuItem(title: "Remove \(remote)", action: #selector(removeRemote(_:)), keyEquivalent: "")
+                removeItem.target = self
+                removeItem.representedObject = remote
+                sub.addItem(removeItem)
+                item.submenu = sub
                 menu.addItem(item)
             }
         }
+
+        let addRemote = NSMenuItem(title: "  Add Remote…", action: #selector(addRemote), keyEquivalent: "")
+        addRemote.target = self
+        menu.addItem(addRemote)
 
         menu.addItem(.separator())
 
@@ -127,6 +146,54 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func switchToRelay() {
         relay.connectRelay(to: relay.hostAddress)
+        rebuildMenu()
+    }
+
+    @objc private func editRelayURL() {
+        let alert = NSAlert()
+        alert.messageText = "Relay URL"
+        alert.informativeText = "Host of the herdr-remote relay. A bare host works too — e.g. 127.0.0.1:8375 or my-mac.ts.net."
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.stringValue = relay.hostAddress
+        field.placeholderString = "ws://127.0.0.1:8375"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let entered = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !entered.isEmpty else { return }
+        relay.connectRelay(to: entered)  // normalizes, persists, and switches to relay mode
+        rebuildMenu()
+    }
+
+    @objc private func addRemote() {
+        let alert = NSAlert()
+        alert.messageText = "Add Remote Host"
+        alert.informativeText = "SSH target polled with herdr, e.g. user@my-server.ts.net. Leave the password blank to use SSH keys."
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 56))
+        let hostField = NSTextField(frame: NSRect(x: 0, y: 30, width: 320, height: 24))
+        hostField.placeholderString = "user@host"
+        let pwField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        pwField.placeholderString = "password (optional)"
+        container.addSubview(hostField)
+        container.addSubview(pwField)
+        alert.accessoryView = container
+        alert.window.initialFirstResponder = hostField
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty else { return }
+        relay.addRemote(host, password: pwField.stringValue.isEmpty ? nil : pwField.stringValue)
+        rebuildMenu()
+    }
+
+    @objc private func removeRemote(_ sender: NSMenuItem) {
+        guard let remote = sender.representedObject as? String else { return }
+        relay.removeRemote(remote)
         rebuildMenu()
     }
 

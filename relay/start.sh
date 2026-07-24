@@ -39,9 +39,12 @@ if ! kill -0 "$RELAY_PID" 2>/dev/null; then
 fi
 echo "Relay running (pid $RELAY_PID)"
 
-# 2. Start tunnel (if cloudflared available)
-if command -v cloudflared >/dev/null 2>&1; then
-    TUNNEL_MODE="${HERDR_TUNNEL_MODE:-temp}"
+# 2. Start tunnel (unless disabled, and only if cloudflared is available)
+TUNNEL_MODE="${HERDR_TUNNEL_MODE:-temp}"
+
+if [ "$TUNNEL_MODE" = "none" ]; then
+    echo "Tunnel disabled (HERDR_TUNNEL_MODE=none) — local/Tailscale only."
+elif command -v cloudflared >/dev/null 2>&1; then
 
     if [ "$TUNNEL_MODE" = "named" ] && [ -n "$HERDR_TUNNEL_NAME" ]; then
         echo "Starting named tunnel ($HERDR_TUNNEL_NAME)..."
@@ -79,12 +82,10 @@ if command -v cloudflared >/dev/null 2>&1; then
         fi
     fi
 
-    if [ "$TUNNEL_MODE" = "none" ]; then
-        echo "Tunnel disabled (config: HERDR_TUNNEL_MODE=none)"
-    fi
 else
     echo "cloudflared not found — running local only."
-    echo "Install: brew install cloudflared"
+    echo "  For remote access over Tailscale this is fine; set HERDR_TUNNEL_MODE=none to silence this."
+    echo "  For a public URL instead: brew install cloudflared"
 fi
 
 echo ""
