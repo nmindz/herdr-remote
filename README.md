@@ -14,6 +14,17 @@ Monitors all your local herdr agents automatically -- no relay, no config, no ac
 curl -sL https://github.com/dcolinmorgan/herdr-remote/releases/latest/download/Herdi-0.6.3.dmg -o /tmp/Herdi.dmg && open /tmp/Herdi.dmg
 ```
 
+### Build it yourself
+
+```bash
+make install     # build Herdi.app and copy it into /Applications
+```
+
+`make` on its own lists every target — `make app` for just the bundle, `make dmg` for a
+distributable image, `make run` to launch a build without installing, `make relay` for the relay.
+The version is set once in the Makefile and passed to both build scripts, so
+`make dmg VERSION=0.7.0` is all it takes to cut a differently-numbered image.
+
 ## What you get
 
 - **Live agent timeline** -- who worked when, who blocked, who finished

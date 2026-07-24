@@ -34,29 +34,35 @@ The relay (`relay/herdr_relay.py`) is the central hub: it polls herdr for agent 
 
 ## Running Components
 
-All Python scripts use [PEP 723 inline metadata](https://peps.python.org/pep-0723/) — `uv run` handles dependency installation automatically.
+Python scripts use [PEP 723 inline metadata](https://peps.python.org/pep-0723/) — `uv run` installs deps. Nothing to install first.
+
+`make` (no args) lists every target. Preferred entry points:
+
+| Target | Runs |
+|--------|------|
+| `make install` | build `Herdi.app` → copy to `/Applications` (quits running copy first) |
+| `make app` / `make bundle` | `herdi-mac/build.sh` → `herdi-mac/dist/Herdi.app` |
+| `make dmg` | `herdi-mac/dmg.sh` → `dist/Herdi-$(VERSION).dmg` |
+| `make run` | build + launch from `dist/`, no install |
+| `make relay` | `uv run relay/herdr_relay.py` |
+| `make start` | `relay/start.sh` (relay + cloudflared) |
+| `make tui` / `make telegram` | TUI / Telegram bot |
+| `make ios` | `xcodegen generate` in `herdi-ios/` |
+| `make check` | `swift build` + Python/shell syntax |
+| `make clean` / `make distclean` | drop build output / also generated `.xcodeproj` |
+
+Version lives in the Makefile (`VERSION ?= 0.6.3`), exported to both shell scripts. Override: `make dmg VERSION=0.7.0`.
+
+Raw equivalents:
 
 ```bash
-# Relay (main server)
-uv run relay/herdr_relay.py
-
-# Full setup with Cloudflare tunnel
-relay/start.sh
-
-# Telegram bot
-HERDI_TG_TOKEN="..." HERDI_TG_CHAT_ID="..." uv run relay/herdr_telegram.py
-
-# Terminal TUI
-uv run relay/herdr_tui.py
-
-# Demo worker (Cloudflare)
-cd demo-worker && npx wrangler dev
-
-# macOS app
-cd herdi-mac && ./build.sh
-
-# iOS app (generate Xcode project)
-cd herdi-ios && xcodegen generate
+uv run relay/herdr_relay.py                    # relay
+relay/start.sh                                 # relay + tunnel
+HERDR_TG_TOKEN=… HERDR_TG_CHAT_ID=… uv run relay/herdr_telegram.py
+uv run relay/herdr_tui.py                      # TUI
+cd demo-worker && npx wrangler dev             # demo worker
+cd herdi-mac && ./build.sh                     # macOS app
+cd herdi-ios && xcodegen generate              # iOS project
 ```
 
 ## Key Environment Variables
@@ -87,4 +93,4 @@ Messages are JSON with a `type` field:
 
 - Web app: Cloudflare Pages (push to main deploys `web/`)
 - Demo worker: `npx wrangler deploy` from `demo-worker/`
-- macOS app: `herdi-mac/build.sh` produces `dist/Herdi.app`
+- macOS app: `make dmg` → `herdi-mac/dist/Herdi-$(VERSION).dmg` for release; `make install` for local
