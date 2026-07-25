@@ -15,9 +15,10 @@ IOS_DIR    := herdi-ios
 RELAY_DIR  := relay
 APP_BUNDLE := $(MAC_DIR)/dist/$(APP_NAME).app
 
-# Single source of truth for the version. build.sh/dmg.sh default to the same value when run
-# directly, so `make dmg VERSION=0.7.0` renames the artifact without editing either script.
-VERSION ?= 0.6.3
+# Single source of truth for the version: the VERSION file at the repo root. build.sh/dmg.sh read
+# the same file when run directly, and `scripts/bump-version.cjs` is the only thing that writes it
+# (semantic-release calls it). Override for a one-off build with `make dmg VERSION=0.7.0`.
+VERSION ?= $(shell cat VERSION 2>/dev/null || echo 0.0.0)
 export VERSION
 
 UNAME_S := $(shell uname -s)
@@ -25,7 +26,7 @@ UV      := uv
 
 .DEFAULT_GOAL := help
 
-.PHONY: help app bundle dmg install uninstall run relay start tui telegram plugin ios web check clean distclean
+.PHONY: help app bundle dmg install uninstall run relay start tui telegram plugin ios web check version-check clean distclean
 
 help:
 	@echo "herdr-remote — v$(VERSION)"
@@ -145,7 +146,24 @@ check:
 	@for f in $(RELAY_DIR)/*.py; do python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$$f" || exit 1; done
 	@echo "▸ shell syntax"
 	@for f in $(RELAY_DIR)/start.sh $(MAC_DIR)/build.sh $(MAC_DIR)/dmg.sh; do bash -n "$$f" || exit 1; done
+	@$(MAKE) --no-print-directory version-check
 	@echo "✓ checks passed"
+
+# Catch a hand-edited manifest drifting from VERSION. Nothing syncs these at build time — the bump
+# script writes them together at release time — so drift would otherwise ship silently.
+version-check:
+	@echo "▸ version consistency (VERSION = $(VERSION))"
+	@fail=0; \
+	for f in herdr-plugin.toml $(RELAY_DIR)/herdr-plugin.toml; do \
+	  got=$$(sed -nE 's/^version = "(.*)"/\1/p' "$$f" | head -1); \
+	  if [ "$$got" != "$(VERSION)" ]; then \
+	    echo "  ✗ $$f has $$got, expected $(VERSION)"; fail=1; \
+	  fi; \
+	done; \
+	if [ "$$fail" = "1" ]; then \
+	  echo "  run: node scripts/bump-version.cjs $(VERSION)"; exit 1; \
+	fi; \
+	echo "  ✓ manifests match VERSION"
 
 clean:
 	rm -rf $(MAC_DIR)/.build $(MAC_DIR)/dist

@@ -4,7 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="Herdi"
 DMG_NAME="Herdi"
-VERSION="${VERSION:-0.6.3}"
+# Single source of truth: <repo>/VERSION (see build.sh).
+VERSION="${VERSION:-$(cat "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo 0.0.0)}"
 APP_DIR="$SCRIPT_DIR/dist/$APP_NAME.app"
 DMG_DIR="$SCRIPT_DIR/dist/dmg"
 DMG_PATH="$SCRIPT_DIR/dist/$DMG_NAME-$VERSION.dmg"

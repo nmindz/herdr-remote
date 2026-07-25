@@ -4,7 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="Herdi"
 BUNDLE_ID="com.dcolinmorgan.herdi"
-VERSION="${VERSION:-0.6.3}"
+# Single source of truth: <repo>/VERSION. The env var lets `make` (and CI) override without
+# editing anything; the file is the fallback so this script still works standalone.
+VERSION="${VERSION:-$(cat "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo 0.0.0)}"
 BUILD_DIR="$SCRIPT_DIR/.build/release"
 APP_DIR="$SCRIPT_DIR/dist/$APP_NAME.app"
 
