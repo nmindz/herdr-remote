@@ -1,0 +1,77 @@
+name: CI
+
+# Cost model (macOS runners bill 10x, Linux 1x):
+#   - There is deliberately NO `push:` trigger. Direct pushes to main never start a run.
+#   - PR open/update runs ONE ubuntu gate job: syntax + version-consistency, no Swift, no bundles.
+#   - The release job (macOS, because it builds the .app/.dmg) runs ONLY when a PR is MERGED into
+#     main, or on an explicit manual dispatch with release=true.
+#   - `[skip ci]` on semantic-release's own commit, plus no push trigger, means the release commit
+#     cannot re-trigger anything.
+
+on:
+  pull_request:
+    branches: ["main"]
+    # `closed` is here so a MERGED pr can trigger the release; unmerged closes are filtered by the
+    # job-level `if:`.
+    types: [opened, synchronize, reopened, closed]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Run the release job (build the DMG and publish via semantic-release)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    # Skip on `closed` — nothing to gate once the PR is done.
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checks
+        # `make check` skips the Swift build off macOS by design, so this stays a 1x job. Swift
+        # compiles on the release runner, which is the only place a broken build would matter.
+        run: make check
+      - name: Repo test suite
+        run: sh tests/run.sh
+
+  release:
+    if: >-
+      (github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true) ||
+      (github.event_name == 'workflow_dispatch' && inputs.release)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Verify the app builds
+        run: make check
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # No package.json in this repo, so pull semantic-release and only the plugins used by
+        # .releaserc.json. --no-save keeps the tree clean for @semantic-release/git.
+        run: |
+          npm install --no-save --no-audit --no-fund \
+            semantic-release \
+            @semantic-release/changelog \
+            @semantic-release/exec \
+            @semantic-release/git
+          npx semantic-release

@@ -1,0 +1,46 @@
+{
+  "branches": ["main"],
+  "plugins": [
+    [
+      "@semantic-release/commit-analyzer",
+      {
+        "releaseRules": [
+          { "type": "feat", "release": "minor" },
+          { "type": "fix", "release": "patch" },
+          { "type": "perf", "release": "patch" },
+          { "type": "refactor", "release": "patch" },
+          { "type": "build", "release": false },
+          { "type": "chore", "release": false },
+          { "type": "ci", "release": false },
+          { "type": "docs", "release": false },
+          { "type": "style", "release": false },
+          { "type": "test", "release": false }
+        ]
+      }
+    ],
+    "@semantic-release/release-notes-generator",
+    ["@semantic-release/changelog", { "changelogFile": "CHANGELOG.md" }],
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "node scripts/bump-version.cjs ${nextRelease.version} && make dmg VERSION=${nextRelease.version}"
+      }
+    ],
+    [
+      "@semantic-release/github",
+      {
+        "successComment": false,
+        "failTitle": false,
+        "assets": [{ "path": "herdi-mac/dist/*.dmg", "label": "macOS disk image" }]
+      }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["CHANGELOG.md", "VERSION", "herdr-plugin.toml", "relay/herdr-plugin.toml"],
+        "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+      }
+    ]
+  ],
+  "tagFormat": "v${version}"
+}
