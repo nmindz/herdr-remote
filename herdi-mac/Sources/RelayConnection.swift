@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Network
 import Observation
@@ -122,8 +123,12 @@ final class RelayConnection {
                         }
                         if existing.project != a.project { existing.project = a.project }
                         if existing.host != a.host { existing.host = a.host }
+                        if let w = a.workspaceId { existing.workspaceId = w }
+                        if let t = a.tabId { existing.tabId = t }
                     } else {
-                        let agent = Agent(id: a.id, name: a.name, status: a.status, project: a.project, cwd: a.cwd, host: a.host)
+                        let agent = Agent(id: a.id, name: a.name, status: a.status, project: a.project,
+                                          cwd: a.cwd, host: a.host,
+                                          workspaceId: a.workspaceId, tabId: a.tabId)
                         agents.append(agent)
                         if a.status == .blocked { readPaneForBlocked(agent, remote: a.host == "local" ? nil : a.host) }
                     }
@@ -135,6 +140,7 @@ final class RelayConnection {
 
     private struct ParsedAgent {
         let id: String, name: String, status: AgentStatus, project: String, cwd: String, host: String
+        let workspaceId: String?, tabId: String?
     }
 
     private func parseAgents(from output: String, host: String) -> [ParsedAgent] {
@@ -148,7 +154,10 @@ final class RelayConnection {
             let paneId = (host == "local" ? "" : "\(host):") + (p["pane_id"] as? String ?? "")
             let status = AgentStatus(rawValue: p["agent_status"] as? String ?? "unknown") ?? .unknown
             let cwd = p["cwd"] as? String ?? ""
-            return ParsedAgent(id: paneId, name: agent, status: status, project: (cwd as NSString).lastPathComponent, cwd: cwd, host: host)
+            return ParsedAgent(id: paneId, name: agent, status: status,
+                               project: (cwd as NSString).lastPathComponent, cwd: cwd, host: host,
+                               workspaceId: p["workspace_id"] as? String,
+                               tabId: p["tab_id"] as? String)
         }
     }
 
@@ -313,10 +322,45 @@ final class RelayConnection {
         }
     }
 
-    func focusPane(_ paneId: String) {
-        DispatchQueue.global(qos: .userInitiated).async { [self] in
-            _ = runHerdr("pane", "focus", paneId)
+    /// Bring the terminal to the agent's pane.
+    ///
+    /// `herdr pane focus` is NOT "focus this pane" — it takes `--direction left|right|up|down` and
+    /// moves to a *neighbouring* pane, so the old `herdr pane focus <id>` was silently a no-op
+    /// (runHerdr swallows the non-zero exit). There is no focus-pane-by-id command; the working
+    /// route is to focus the pane's workspace and then its tab, then raise the terminal app so the
+    /// window actually comes forward.
+    func jumpToAgent(_ agent: Agent) {
+        guard agent.host == "local" else {
+            lastError = "Can't jump to \(agent.host) — that agent is on another machine."
+            return
         }
+        guard let workspace = agent.workspaceId, !workspace.isEmpty,
+              let tab = agent.tabId, !tab.isEmpty else {
+            lastError = "Don't know where \(agent.name) lives yet — waiting for the next poll."
+            log.info("jump skipped: no workspace/tab for \(agent.id, privacy: .public)")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            _ = runHerdr("workspace", "focus", workspace)
+            _ = runHerdr("tab", "focus", tab)
+            DispatchQueue.main.async { Self.activateTerminal() }
+        }
+    }
+
+    /// Raise whichever terminal is hosting herdr. Focusing a tab only changes herdr's internal
+    /// selection — without this the window stays behind everything and the button looks dead.
+    private static func activateTerminal() {
+        let running = NSWorkspace.shared.runningApplications
+        // Prefer an app that actually has a herdr process under it; fall back to known terminals.
+        let candidates = ["com.mitchellh.ghostty", "com.googlecode.iterm2", "net.kovidgoyal.kitty",
+                          "com.github.wez.wezterm", "io.alacritty", "com.apple.Terminal"]
+        for id in candidates {
+            if let app = running.first(where: { $0.bundleIdentifier == id }) {
+                app.activate(options: [])
+                return
+            }
+        }
+        log.warning("No known terminal app found to raise")
     }
 
     func interruptPane(_ paneId: String) {
@@ -373,22 +417,30 @@ final class RelayConnection {
             case "agents":
                 guard let list = msg.agents else { return }
                 var seen = Set<String>()
+                // A single-entry list is the push-event delta, not a full census — merging it and
+                // then pruning to `seen` would wipe every other agent off the list.
+                let isDelta = list.count == 1 && agents.count > 1
                 for a in list {
                     seen.insert(a.pane_id)
                     if let existing = agents.first(where: { $0.id == a.pane_id }) {
-                        let s = AgentStatus(rawValue: a.status) ?? .unknown
-                        if existing.status != s { existing.status = s }
-                        if existing.project != a.project { existing.project = a.project }
-                        existing.host = a.host ?? "local"
+                        if let s = a.status.flatMap(AgentStatus.init(rawValue:)), existing.status != s {
+                            existing.status = s
+                        }
+                        if let p = a.project, !p.isEmpty, existing.project != p { existing.project = p }
+                        if let h = a.host, !h.isEmpty { existing.host = h }
+                        // Deltas omit these; keep what the last full poll told us.
+                        if let w = a.workspace_id, !w.isEmpty { existing.workspaceId = w }
+                        if let t = a.tab_id, !t.isEmpty { existing.tabId = t }
                     } else {
                         agents.append(Agent(
-                            id: a.pane_id, name: a.agent,
-                            status: AgentStatus(rawValue: a.status) ?? .unknown,
-                            project: a.project, cwd: a.cwd, host: a.host ?? "local"
+                            id: a.pane_id, name: a.agent ?? "agent",
+                            status: a.status.flatMap(AgentStatus.init(rawValue:)) ?? .unknown,
+                            project: a.project ?? "", cwd: a.cwd ?? "", host: a.host ?? "local",
+                            workspaceId: a.workspace_id, tabId: a.tab_id
                         ))
                     }
                 }
-                agents.removeAll { !seen.contains($0.id) }
+                if !isDelta { agents.removeAll { !seen.contains($0.id) } }
             case "blocked":
                 if let pid = msg.pane_id, let agent = agents.first(where: { $0.id == pid }) {
                     agent.prompt = msg.prompt

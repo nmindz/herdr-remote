@@ -122,7 +122,7 @@ struct NotchPanelView: View {
                         controller.surface = .approval(agentId: agent.id)
                     }
                 },
-                onJump: { relay.focusPane($0.id) }
+                onJump: { relay.jumpToAgent($0) }
             )
             .transition(.blurFade.combined(with: .move(edge: .top)))
         case .collapsed:
@@ -478,13 +478,18 @@ private struct AgentSessionRow: View {
                         .help("Allow")
                     }
 
-                    Button { relay.focusPane(agent.id) } label: {
+                    Button { relay.jumpToAgent(agent) } label: {
                         Image(systemName: "arrow.up.forward.square")
                             .font(.system(size: 12))
-                            .foregroundStyle(.blue.opacity(0.8))
+                            .foregroundStyle(.blue.opacity(agent.canJump ? 0.8 : 0.25))
                     }
                     .buttonStyle(.plain)
-                    .help("Jump to terminal")
+                    .disabled(!agent.canJump)
+                    .help(agent.canJump
+                          ? "Jump to terminal"
+                          : (agent.host == "local"
+                             ? "Location not known yet"
+                             : "Agent is on \(agent.host)"))
 
                     if style == .working || style == .blocked {
                         Button { relay.interruptPane(agent.id) } label: {
