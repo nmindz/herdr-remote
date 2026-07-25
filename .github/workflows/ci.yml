@@ -1,16 +1,16 @@
 name: CI
 
 # Cost model (macOS runners bill 10x, Linux 1x):
-#   - There is deliberately NO `push:` trigger. Direct pushes to main never start a run.
+#   - There is deliberately NO `push:` trigger. Direct pushes to master never start a run.
 #   - PR open/update runs ONE ubuntu gate job: syntax + version-consistency, no Swift, no bundles.
 #   - The release job (macOS, because it builds the .app/.dmg) runs ONLY when a PR is MERGED into
-#     main, or on an explicit manual dispatch with release=true.
+#     master, or on an explicit manual dispatch with release=true.
 #   - `[skip ci]` on semantic-release's own commit, plus no push trigger, means the release commit
 #     cannot re-trigger anything.
 
 on:
   pull_request:
-    branches: ["main"]
+    branches: ["master"]
     # `closed` is here so a MERGED pr can trigger the release; unmerged closes are filtered by the
     # job-level `if:`.
     types: [opened, synchronize, reopened, closed]
