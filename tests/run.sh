@@ -81,7 +81,7 @@ echo "12. build.sh and dmg.sh present"
 assert_eq "$?" "0" "build scripts present"
 
 echo "13. updater points to correct repo"
-grep -q "dcolinmorgan/herdr-remote" "$DIR/herdi-mac/Sources/Updater.swift"
+grep -q "nmindz/herdr-remote" "$DIR/herdi-mac/Sources/Updater.swift"
 assert_eq "$?" "0" "updater repo correct"
 
 # --- Demo worker ---
