@@ -170,7 +170,12 @@ final class PanelWindowController: NSObject, NSWindowDelegate {
             Task { @MainActor in self?.handleSpaceChange() }
         }
 
-        // Global click: collapse expanded panel when clicking outside
+        installClickMonitor()
+    }
+
+    /// Global click: collapse expanded panel when clicking outside.
+    private func installClickMonitor() {
+        guard globalClickMonitor == nil else { return }
         globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.surface.isExpanded else { return }
@@ -182,6 +187,35 @@ final class PanelWindowController: NSObject, NSWindowDelegate {
             }
         }
     }
+
+    private func removeClickMonitor() {
+        if let monitor = globalClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            globalClickMonitor = nil
+        }
+    }
+
+    /// Show or hide the notch overlay. Disabled is the "status-bar dropdown only" mode — the window
+    /// is ordered out AND the global mouse monitor is removed, so a user who turns this off (say,
+    /// because another notch app already owns that space) is not left paying for an invisible
+    /// overlay that still watches every click.
+    func setEnabled(_ enabled: Bool) {
+        if enabled {
+            if panel == nil {
+                showPanel()
+            } else {
+                installClickMonitor()
+                updatePosition()
+                panel?.orderFrontRegardless()
+            }
+        } else {
+            surface = .collapsed
+            removeClickMonitor()
+            panel?.orderOut(nil)
+        }
+    }
+
+    var isEnabled: Bool { panel?.isVisible ?? false }
 
     private func panelSize(for screen: NSScreen) -> NSSize {
         let maxH: CGFloat = 420
@@ -226,6 +260,8 @@ final class PanelWindowController: NSObject, NSWindowDelegate {
     }
 
     private func handleSpaceChange() {
+        // Nothing to reveal while the overlay is switched off.
+        guard NotchSettings.panelEnabled else { return }
         if isActiveSpaceFullscreen() {
             fullscreenLatch = true
             panel?.orderOut(nil)
@@ -261,6 +297,19 @@ final class PanelWindowController: NSObject, NSWindowDelegate {
         if let monitor = globalClickMonitor {
             NSEvent.removeMonitor(monitor)
         }
+    }
+}
+
+// MARK: - Notch panel preference
+
+/// Whether the notch overlay is shown at all. Off means status-bar dropdown only — useful when
+/// another notch-style app already owns that part of the screen.
+enum NotchSettings {
+    static let defaultsKey = "notchPanelEnabled"
+
+    /// Defaults to ON, preserving existing behaviour for anyone who never opens Settings.
+    static var panelEnabled: Bool {
+        UserDefaults.standard.object(forKey: defaultsKey) as? Bool ?? true
     }
 }
 

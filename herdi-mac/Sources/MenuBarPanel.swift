@@ -157,6 +157,7 @@ struct SettingsPanel: View {
     @State private var relayURL: String
     @State private var newRemote = ""
     @State private var newPassword = ""
+    @AppStorage(NotchSettings.defaultsKey) private var notchPanelEnabled = true
 
     init(relay: RelayConnection, launchAtLogin: Binding<Bool>, updater: Updater) {
         self.relay = relay
@@ -254,6 +255,16 @@ struct SettingsPanel: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Toggle("Launch at Login", isOn: $launchAtLogin)
                             .toggleStyle(.switch).controlSize(.small)
+
+                        Divider()
+
+                        Toggle("Notch panel", isOn: $notchPanelEnabled)
+                            .toggleStyle(.switch).controlSize(.small)
+                        Text(notchPanelEnabled
+                             ? "Overlay at the top of the screen. Hover it to see agents."
+                             : "Off — this menu is the only interface. Turn on if you want the overlay back.")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(4)
                 }

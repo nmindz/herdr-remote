@@ -18,6 +18,8 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
     let relay = RelayConnection()
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
+    private var appliedNotchEnabled = true
+    private var observingNotchSetting = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Request notification permissions
@@ -26,12 +28,51 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
         // Minimal status bar item (quit + show panel)
         setupStatusItem()
 
-        // Launch the notch panel
+        // The notch overlay is optional — the status-bar dropdown is the app on its own.
         panelController = PanelWindowController(relay: relay)
-        panelController?.showPanel()
+        if NotchSettings.panelEnabled {
+            panelController?.showPanel()
+        }
+        observeNotchSetting()
 
         // Auto-expand when an agent gets blocked
         observeBlockedAgents()
+    }
+
+    /// Apply the notch preference live.
+    ///
+    /// KVO on the key, not `UserDefaults.didChangeNotification` — that notification only fires for
+    /// writes made inside this process, so the setting would silently not apply when changed by any
+    /// other route. KVO observes both, which also keeps UserDefaults the single source of truth
+    /// instead of adding a bespoke notification just for the toggle.
+    private func observeNotchSetting() {
+        appliedNotchEnabled = NotchSettings.panelEnabled
+        UserDefaults.standard.addObserver(
+            self, forKeyPath: NotchSettings.defaultsKey, options: [.new], context: nil
+        )
+        observingNotchSetting = true
+    }
+
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?,
+                               change: [NSKeyValueChangeKey: Any]?,
+                               context: UnsafeMutableRawPointer?) {
+        guard keyPath == NotchSettings.defaultsKey else {
+            super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
+            return
+        }
+        Task { @MainActor in
+            let enabled = NotchSettings.panelEnabled
+            guard enabled != self.appliedNotchEnabled else { return }
+            self.appliedNotchEnabled = enabled
+            self.panelController?.setEnabled(enabled)
+        }
+    }
+
+    deinit {
+        // removeObserver throws if it was never added.
+        if observingNotchSetting {
+            UserDefaults.standard.removeObserver(self, forKeyPath: NotchSettings.defaultsKey)
+        }
     }
 
     private func setupStatusItem() {
@@ -89,8 +130,10 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
 
-                // Auto-pop the approval card if panel is collapsed and there's a blocked agent
-                if let agent = blocked.first, self.panelController?.surface == .collapsed {
+                // Auto-pop the approval card if panel is collapsed and there's a blocked agent.
+                // Skipped when the overlay is off, or a blocked agent would pop it back on screen.
+                if NotchSettings.panelEnabled,
+                   let agent = blocked.first, self.panelController?.surface == .collapsed {
                     withAnimation(NotchAnimation.pop) {
                         self.panelController?.surface = .approval(agentId: agent.id)
                     }
