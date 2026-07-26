@@ -122,60 +122,9 @@ final class Updater {
 
     // MARK: - gh CLI strategy
 
-    /// Located once per process. A packaged .app launches without a shell profile (launchd gives it
-    /// a minimal PATH), so scanning PATH alone misses both Homebrew and version-manager installs —
-    /// a `gh` under mise/asdf is invisible to the app otherwise.
-    private static let ghPath: String? = discoverGh()
-
-    private static func discoverGh() -> String? {
-        let fm = FileManager.default
-
-        // 1. PATH — covers dev runs and any GUI session with a usable PATH.
-        if let path = ProcessInfo.processInfo.environment["PATH"] {
-            for dir in path.split(separator: ":") {
-                let candidate = "\(dir)/gh"
-                if fm.isExecutableFile(atPath: candidate) { return candidate }
-            }
-        }
-
-        // 2. The user's LOGIN shell, which sources their profile — this is what resolves mise/asdf
-        //    shims and custom PATH setups. ~40ms, and only on an explicit update check.
-        if let found = loginShellWhich("gh") { return found }
-
-        // 3. Well-known locations, as a last resort.
-        let home = fm.homeDirectoryForCurrentUser.path
-        let known = [
-            "/opt/homebrew/bin/gh",
-            "/usr/local/bin/gh",
-            "/usr/bin/gh",
-            "/home/linuxbrew/.linuxbrew/bin/gh",
-            "\(home)/.local/share/mise/shims/gh",
-            "\(home)/.asdf/shims/gh",
-            "\(home)/.local/bin/gh",
-        ]
-        return known.first { fm.isExecutableFile(atPath: $0) }
-    }
-
-    private static func loginShellWhich(_ exe: String) -> String? {
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/sh"
-        guard FileManager.default.isExecutableFile(atPath: shell) else { return nil }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: shell)
-        process.arguments = ["-l", "-c", "command -v \(exe)"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return nil }
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            let path = out.trimmingCharacters(in: .whitespacesAndNewlines)
-            return FileManager.default.isExecutableFile(atPath: path) ? path : nil
-        } catch {
-            return nil
-        }
-    }
+    /// Located via ToolLocator, which searches the login shell's PATH — a packaged .app gets
+    /// launchd's minimal PATH, so a `gh` under a version manager is otherwise invisible.
+    private static let ghPath: String? = ToolLocator.find("gh")
 
     private func ghRelease() async -> ReleaseResult {
         guard let gh = Updater.ghPath else { return .failure("GitHub CLI (gh) not found") }
@@ -184,6 +133,7 @@ final class Updater {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: gh)
                 process.arguments = ["api", "repos/\(self.repo)/releases/latest"]
+                process.environment = ToolLocator.childEnvironment()
                 let out = Pipe(), err = Pipe()
                 process.standardOutput = out
                 process.standardError = err

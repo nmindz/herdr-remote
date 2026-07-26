@@ -61,12 +61,22 @@ final class RelayConnection {
     private var reconnecting = false
     private var handshakeWatchdog: Timer?
     var lastError: String?
-    private let herdrPath: String
+    /// nil when herdr cannot be found at all — every shell-out then fails, so callers report it
+    /// rather than silently doing nothing.
+    private let herdrPath: String?
     var remotes: [String] = [] // SSH targets, e.g. ["user@host"]
 
     init() {
-        herdrPath = ProcessInfo.processInfo.environment["HERDR_BIN"]
-            ?? "/opt/homebrew/bin/herdr"
+        // Was hardcoded to /opt/homebrew/bin/herdr, which does not exist for anyone who installed
+        // herdr any other way (~/.local/bin, mise, MacPorts). Process.run() then threw on every call
+        // and the error was discarded, so Direct mode, interrupt and jump-to-terminal all quietly
+        // did nothing.
+        herdrPath = ToolLocator.find("herdr", overrideEnv: "HERDR_BIN")
+        if herdrPath == nil {
+            log.error("herdr binary not found — set HERDR_BIN or install herdr")
+        } else {
+            log.info("Using herdr at \(self.herdrPath ?? "-", privacy: .public)")
+        }
         // Load saved remotes
         if let saved = UserDefaults.standard.stringArray(forKey: "herdi_remotes") {
             remotes = saved
@@ -165,14 +175,16 @@ final class RelayConnection {
         let process = Process()
         let password = KeychainHelper.getPassword(for: remote)
 
-        if let password, FileManager.default.fileExists(atPath: "/opt/homebrew/bin/sshpass") {
+        let sshpath = ToolLocator.find("ssh") ?? "/usr/bin/ssh"
+        if let password, let sshpass = ToolLocator.find("sshpass") {
             // Use sshpass for password auth
-            process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/sshpass")
+            process.executableURL = URL(fileURLWithPath: sshpass)
             process.arguments = ["-p", password, "ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", remote] + args
         } else {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+            process.executableURL = URL(fileURLWithPath: sshpath)
             process.arguments = ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", remote] + args
         }
+        process.environment = ToolLocator.childEnvironment()
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -238,20 +250,46 @@ final class RelayConnection {
         return ["yes, single permission", "trust, always allow", "no (tab to edit)"]
     }
 
+    @discardableResult
     private func runHerdr(_ args: String...) -> String {
+        runHerdrChecked(Array(args)).output
+    }
+
+    /// Shell out to herdr, reporting *why* it failed. The previous version returned "" for both "no
+    /// output" and "could not even launch the binary", which is how a missing herdr went unnoticed.
+    private func runHerdrChecked(_ args: [String]) -> (output: String, ok: Bool, error: String?) {
+        guard let herdrPath else {
+            return ("", false, "herdr not found — set HERDR_BIN in the app's environment, or install herdr")
+        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: herdrPath)
-        process.arguments = Array(args)
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        process.arguments = args
+        // Give it the PATH the user would have in a terminal, so anything herdr shells out to
+        // resolves too — launchd's minimal PATH is not enough.
+        process.environment = ToolLocator.childEnvironment()
+        let out = Pipe(), err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
         do {
             try process.run()
-            process.waitUntilExit()
-            return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         } catch {
-            return ""
+            // A previously-good path can go stale (tool upgraded, version manager reshuffled).
+            ToolLocator.forget("herdr")
+            let reason = "cannot run \(herdrPath): \(error.localizedDescription)"
+            log.error("\(reason, privacy: .public)")
+            return ("", false, reason)
         }
+        let stdout = out.fileHandleForReading.readDataToEndOfFile()
+        let stderr = err.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let text = String(data: stdout, encoding: .utf8) ?? ""
+        guard process.terminationStatus == 0 else {
+            let msg = (String(data: stderr, encoding: .utf8) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            log.error("herdr \(args.joined(separator: " "), privacy: .public) exited \(process.terminationStatus): \(msg, privacy: .public)")
+            return (text, false, msg.isEmpty ? "herdr exited \(process.terminationStatus)" : msg)
+        }
+        return (text, true, nil)
     }
 
     // MARK: - Relay Mode (WebSocket)
@@ -341,9 +379,15 @@ final class RelayConnection {
             return
         }
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            _ = runHerdr("workspace", "focus", workspace)
-            _ = runHerdr("tab", "focus", tab)
-            DispatchQueue.main.async { Self.activateTerminal() }
+            let ws = runHerdrChecked(["workspace", "focus", workspace])
+            let tb = runHerdrChecked(["tab", "focus", tab])
+            DispatchQueue.main.async {
+                if let problem = ws.error ?? tb.error {
+                    self.lastError = "Couldn't jump to \(agent.project): \(problem)"
+                    return
+                }
+                Self.activateTerminal()
+            }
         }
     }
 
